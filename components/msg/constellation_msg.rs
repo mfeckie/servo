@@ -11,13 +11,14 @@ use euclid::scale_factor::ScaleFactor;
 use euclid::size::{Size2D, TypedSize2D};
 use hyper::header::Headers;
 use hyper::method::Method;
-use ipc_channel::ipc::{IpcSender, IpcSharedMemory};
+use ipc_channel::ipc::{self, IpcReceiver, IpcSender, IpcSharedMemory, OpaqueIpcSender};
 use layers::geometry::DevicePixel;
 use offscreen_gl_context::GLContextAttributes;
+use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::channel;
 use style_traits::viewport::ViewportConstraints;
 use url::Url;
 use util::cursor::Cursor;
@@ -25,16 +26,17 @@ use util::geometry::{PagePx, ViewportPx};
 use util::mem::HeapSizeOf;
 use webdriver_msg::{LoadStatus, WebDriverScriptCommand};
 
-pub struct ConstellationChan<T>(pub Sender<T>);
+#[derive(Deserialize, Serialize)]
+pub struct ConstellationChan<T: Deserialize + Serialize>(pub IpcSender<T>);
 
-impl<T> ConstellationChan<T> {
-    pub fn new() -> (Receiver<T>, ConstellationChan<T>) {
-        let (chan, port) = channel();
+impl<T: Deserialize + Serialize> ConstellationChan<T> {
+    pub fn new() -> (IpcReceiver<T>, ConstellationChan<T>) {
+        let (chan, port) = ipc::channel().unwrap();
         (port, ConstellationChan(chan))
     }
 }
 
-impl<T> Clone for ConstellationChan<T> {
+impl<T: Serialize + Deserialize> Clone for ConstellationChan<T> {
     fn clone(&self) -> ConstellationChan<T> {
         ConstellationChan(self.0.clone())
     }
@@ -217,21 +219,36 @@ pub enum FocusType {
     Parent,     // Focusing a parent element (an iframe)
 }
 
+#[derive(Deserialize, Serialize)]
+pub struct AsyncIFrameLoad {
+    /// The old subpage ID for this iframe, if a page was previously loaded.
+    pub old_subpage_id: Option<SubpageId>,
+    /// Sandbox type of this iframe
+    pub sandbox: IFrameSandboxState,
+    /// Url to load
+    pub url: Url,
+}
+
+#[derive(Deserialize, Serialize)]
+pub enum IFrameLoadType {
+    /// The initial target event loop for a synchronous about:blank creation, and the
+    /// replacement event loop for all subsequent messages after the frame is created
+    /// by the constellation.
+    Sync((OpaqueIpcSender, OpaqueIpcSender)),
+    Async(AsyncIFrameLoad),
+}
+
 /// Specifies the information required to load a URL in an iframe.
 #[derive(Deserialize, Serialize)]
 pub struct IframeLoadInfo {
-    /// Url to load
-    pub url: Url,
     /// Pipeline ID of the parent of this iframe
     pub containing_pipeline_id: PipelineId,
     /// The new subpage ID for this load
     pub new_subpage_id: SubpageId,
-    /// The old subpage ID for this iframe, if a page was previously loaded.
-    pub old_subpage_id: Option<SubpageId>,
     /// The new pipeline ID that the iframe has generated.
     pub new_pipeline_id: PipelineId,
-    /// Sandbox type of this iframe
-    pub sandbox: IFrameSandboxState,
+    /// The type of load the is being requested.
+    pub load_type: IFrameLoadType,
 }
 
 /// Messages from the compositor to the constellation.

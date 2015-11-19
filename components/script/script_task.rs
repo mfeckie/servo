@@ -104,7 +104,7 @@ use time::{Tm, now};
 use url::{Url, UrlParser};
 use util::opts;
 use util::str::DOMString;
-use util::task::spawn_named_with_send_on_failure;
+use util::task;
 use util::task_state;
 use webdriver_handlers;
 
@@ -232,8 +232,9 @@ pub enum ScriptTaskEventCategory {
     Resize,
     ScriptEvent,
     TimerEvent,
-    UpdateReplacedElement,
     SetViewport,
+    StylesheetLoad,
+    UpdateReplacedElement,
     WebSocketEvent,
     WorkerEvent,
 }
@@ -272,35 +273,37 @@ impl OpaqueSender<CommonScriptMsg> for Box<ScriptChan + Send> {
 /// APIs that need to abstract over multiple kinds of event loops (worker/main thread) with
 /// different Receiver interfaces.
 pub trait ScriptPort {
-    fn recv(&self) -> CommonScriptMsg;
+    fn recv(&self) -> Result<CommonScriptMsg, ()>;
 }
 
 impl ScriptPort for Receiver<CommonScriptMsg> {
-    fn recv(&self) -> CommonScriptMsg {
-        self.recv().unwrap()
+    fn recv(&self) -> Result<CommonScriptMsg, ()> {
+        self.recv().map_err(|_| ())
     }
 }
 
 impl ScriptPort for Receiver<MainThreadScriptMsg> {
-    fn recv(&self) -> CommonScriptMsg {
-        match self.recv().unwrap() {
-            MainThreadScriptMsg::Common(script_msg) => script_msg,
-            _ => panic!("unexpected main thread event message!")
+    fn recv(&self) -> Result<CommonScriptMsg, ()> {
+        match self.recv() {
+            Ok(MainThreadScriptMsg::Common(script_msg)) => Ok(script_msg),
+            Ok(_) => panic!("unexpected main thread event message!"),
+            _ => Err(()),
         }
     }
 }
 
 impl ScriptPort for Receiver<(TrustedWorkerAddress, CommonScriptMsg)> {
-    fn recv(&self) -> CommonScriptMsg {
-        self.recv().unwrap().1
+    fn recv(&self) -> Result<CommonScriptMsg, ()> {
+        self.recv().map(|(_, msg)| msg).map_err(|_| ())
     }
 }
 
 impl ScriptPort for Receiver<(TrustedWorkerAddress, MainThreadScriptMsg)> {
-    fn recv(&self) -> CommonScriptMsg {
-        match self.recv().unwrap().1 {
-            MainThreadScriptMsg::Common(script_msg) => script_msg,
-            _ => panic!("unexpected main thread event message!")
+    fn recv(&self) -> Result<CommonScriptMsg, ()> {
+        match self.recv().map(|(_, msg)| msg) {
+            Ok(MainThreadScriptMsg::Common(script_msg)) => Ok(script_msg),
+            Ok(_) => panic!("unexpected main thread event message!"),
+            _ => Err(()),
         }
     }
 }
@@ -396,7 +399,7 @@ pub struct ScriptTask {
     chan: MainThreadScriptChan,
 
     /// A channel to hand out to tasks that need to respond to a message from the script task.
-    control_chan: Sender<ConstellationControlMsg>,
+    control_chan: IpcSender<ConstellationControlMsg>,
 
     /// The port on which the constellation and layout tasks can communicate with the
     /// script task.
@@ -438,6 +441,8 @@ pub struct ScriptTask {
     scheduler_chan: IpcSender<TimerEventRequest>,
     timer_event_chan: Sender<TimerEvent>,
     timer_event_port: Receiver<TimerEvent>,
+
+    content_process_shutdown_chan: IpcSender<()>,
 }
 
 /// In the event of task failure, all data on the stack runs its destructor. However, there
@@ -484,7 +489,8 @@ impl ScriptTaskFactory for ScriptTask {
         ScriptLayoutChan::new(chan, port)
     }
 
-    fn clone_layout_channel(_phantom: Option<&mut ScriptTask>, pair: &OpaqueScriptLayoutChannel) -> Box<Any + Send> {
+    fn clone_layout_channel(_phantom: Option<&mut ScriptTask>, pair: &OpaqueScriptLayoutChannel)
+                            -> Box<Any + Send> {
         box pair.sender() as Box<Any + Send>
     }
 
@@ -496,9 +502,10 @@ impl ScriptTaskFactory for ScriptTask {
         let (script_chan, script_port) = channel();
         let layout_chan = LayoutChan(layout_chan.sender());
         let failure_info = state.failure_info;
-        spawn_named_with_send_on_failure(format!("ScriptTask {:?}", state.id), task_state::SCRIPT, move || {
+        task::spawn_named_with_send_on_failure(format!("ScriptTask {:?}", state.id),
+                                               task_state::SCRIPT,
+                                               move || {
             PipelineNamespace::install(state.pipeline_namespace_id);
-
             let roots = RootCollection::new();
             let _stack_roots_tls = StackRootTLS::new(&roots);
             let chan = MainThreadScriptChan(script_chan);
@@ -519,11 +526,12 @@ impl ScriptTaskFactory for ScriptTask {
 
             let new_load = InProgressLoad::new(id, parent_info, layout_chan, window_size,
                                                load_data.url.clone());
-            script_task.start_page_load(new_load, load_data);
+            script_task.start_page_load(new_load, load_data, None);
 
             let reporter_name = format!("script-reporter-{}", id);
             mem_profiler_chan.run_with_memory_reporting(|| {
                 script_task.start();
+                let _ = script_task.content_process_shutdown_chan.send(());
             }, reporter_name, channel_for_reporter, CommonScriptMsg::CollectReports);
 
             // This must always be the very last operation performed before the task completes
@@ -589,6 +597,21 @@ unsafe extern "C" fn shadow_check_callback(_cx: *mut JSContext,
 }
 
 impl ScriptTask {
+    pub fn window_for_pipeline(pipeline: PipelineId) -> Root<Window> {
+        SCRIPT_TASK_ROOT.with(|root| {
+            let script_task = unsafe { &*root.borrow().unwrap() };
+            let page = get_page(&script_task.root_page(), pipeline);
+            page.window()
+        })
+    }
+
+    pub fn get_constellation_sender() -> IpcSender<ConstellationControlMsg> {
+        SCRIPT_TASK_ROOT.with(|root| {
+            let script_task = unsafe { &*root.borrow().unwrap() };
+            script_task.control_chan.clone()
+        })
+    }
+
     pub fn page_fetch_complete(id: PipelineId, subpage: Option<SubpageId>, metadata: Metadata)
                                -> Option<Root<ServoHTMLParser>> {
         SCRIPT_TASK_ROOT.with(|root| {
@@ -609,6 +632,15 @@ impl ScriptTask {
             if let Some(script_task) = *root.borrow() {
                 let script_task = unsafe { &*script_task };
                 script_task.handle_msg_from_script(MainThreadScriptMsg::Common(msg));
+            }
+        });
+    }
+
+    pub fn process_constellation_event(msg: ConstellationControlMsg) {
+        SCRIPT_TASK_ROOT.with(|root| {
+            if let Some(script_task) = *root.borrow() {
+                let script_task = unsafe { &*script_task };
+                script_task.handle_msg_from_constellation(msg, true);
             }
         });
     }
@@ -636,6 +668,9 @@ impl ScriptTask {
 
         let (timer_event_chan, timer_event_port) = channel();
 
+        // Ask the router to proxy IPC messages from the control port to us.
+        let control_port = ROUTER.route_ipc_receiver_to_new_mpsc_receiver(state.control_port);
+
         ScriptTask {
             page: DOMRefCell::new(None),
             incomplete_loads: DOMRefCell::new(vec!()),
@@ -650,7 +685,7 @@ impl ScriptTask {
             port: port,
             chan: chan,
             control_chan: state.control_chan,
-            control_port: state.control_port,
+            control_port: control_port,
             constellation_chan: state.constellation_chan,
             compositor: DOMRefCell::new(state.compositor),
             time_profiler_chan: state.time_profiler_chan,
@@ -667,6 +702,8 @@ impl ScriptTask {
             scheduler_chan: state.scheduler_chan,
             timer_event_chan: timer_event_chan,
             timer_event_port: timer_event_port,
+
+            content_process_shutdown_chan: state.content_process_shutdown_chan,
         }
     }
 
@@ -868,7 +905,7 @@ impl ScriptTask {
                             return Some(false)
                         }
                     },
-                    MixedMessage::FromConstellation(inner_msg) => self.handle_msg_from_constellation(inner_msg),
+                    MixedMessage::FromConstellation(inner_msg) => self.handle_msg_from_constellation(inner_msg, false),
                     MixedMessage::FromScript(inner_msg) => self.handle_msg_from_script(inner_msg),
                     MixedMessage::FromScheduler(inner_msg) => self.handle_timer_event(inner_msg),
                     MixedMessage::FromDevtools(inner_msg) => self.handle_msg_from_devtools(inner_msg),
@@ -940,7 +977,10 @@ impl ScriptTask {
                 ScriptTaskEventCategory::NetworkEvent => ProfilerCategory::ScriptNetworkEvent,
                 ScriptTaskEventCategory::Resize => ProfilerCategory::ScriptResize,
                 ScriptTaskEventCategory::ScriptEvent => ProfilerCategory::ScriptEvent,
-                ScriptTaskEventCategory::UpdateReplacedElement => ProfilerCategory::ScriptUpdateReplacedElement,
+                ScriptTaskEventCategory::UpdateReplacedElement => {
+                    ProfilerCategory::ScriptUpdateReplacedElement
+                }
+                ScriptTaskEventCategory::StylesheetLoad => ProfilerCategory::ScriptStylesheetLoad,
                 ScriptTaskEventCategory::SetViewport => ProfilerCategory::ScriptSetViewport,
                 ScriptTaskEventCategory::TimerEvent => ProfilerCategory::ScriptTimerEvent,
                 ScriptTaskEventCategory::WebSocketEvent => ProfilerCategory::ScriptWebSocketEvent,
@@ -952,10 +992,18 @@ impl ScriptTask {
         }
     }
 
-    fn handle_msg_from_constellation(&self, msg: ConstellationControlMsg) {
+    fn handle_msg_from_constellation(&self,
+                                     msg: ConstellationControlMsg,
+                                     allow_attach_layout: bool) {
         match msg {
-            ConstellationControlMsg::AttachLayout(_) =>
-                panic!("should have handled AttachLayout already"),
+            ConstellationControlMsg::AttachLayout(new_layout_info) => {
+                if !allow_attach_layout {
+                    panic!("should have handled AttachLayout already");
+                }
+                self.profile_event(ScriptTaskEventCategory::AttachLayout, || {
+                    self.handle_new_layout(new_layout_info);
+                })
+            }
             ConstellationControlMsg::Navigate(pipeline_id, subpage_id, load_data) =>
                 self.handle_navigate(pipeline_id, Some(subpage_id), load_data),
             ConstellationControlMsg::SendEvent(id, event) =>
@@ -1183,6 +1231,8 @@ impl ScriptTask {
             failure,
             pipeline_port,
             layout_shutdown_chan,
+            content_process_shutdown_chan,
+            is_sync,
         } = new_layout_info;
 
         let layout_pair = ScriptTask::create_layout_channel(None::<&mut ScriptTask>);
@@ -1202,6 +1252,7 @@ impl ScriptTask {
             script_chan: self.control_chan.clone(),
             image_cache_task: self.image_cache_task.clone(),
             layout_shutdown_chan: layout_shutdown_chan,
+            content_process_shutdown_chan: content_process_shutdown_chan,
         };
 
         let page = self.root_page();
@@ -1220,7 +1271,12 @@ impl ScriptTask {
         let new_load = InProgressLoad::new(new_pipeline_id, Some((containing_pipeline_id, subpage_id)),
                                            layout_chan, parent_window.window_size(),
                                            load_data.url.clone());
-        self.start_page_load(new_load, load_data);
+        let script_pair = if is_sync {
+            Some(parent_window.new_script_pair())
+        } else {
+            None
+        };
+        self.start_page_load(new_load, load_data, script_pair);
     }
 
     fn handle_loads_complete(&self, pipeline: PipelineId) {
@@ -1927,19 +1983,28 @@ impl ScriptTask {
 
     /// Initiate a non-blocking fetch for a specified resource. Stores the InProgressLoad
     /// argument until a notification is received that the fetch is complete.
-    fn start_page_load(&self, incomplete: InProgressLoad, mut load_data: LoadData) {
+    fn start_page_load(&self,
+                       incomplete: InProgressLoad,
+                       mut load_data: LoadData,
+                       script_pair: Option<(Box<ScriptChan + Send>, Box<ScriptPort + Send>)>) {
         let id = incomplete.pipeline_id.clone();
         let subpage = incomplete.parent_info.clone().map(|p| p.1);
 
-        let script_chan = self.chan.clone();
+        let context = Arc::new(Mutex::new(ParserContext::new(id, subpage, self.chan.clone(),
+                                                             load_data.url.clone())));
+
         let resource_task = self.resource_task.clone();
 
-        let context = Arc::new(Mutex::new(ParserContext::new(id, subpage, script_chan.clone(),
-                                                             load_data.url.clone())));
+        let (script_chan, script_port) = if let Some((chan, port)) = script_pair {
+            (Some(chan), Some(port))
+        } else {
+            (None, None)
+        };
+
         let (action_sender, action_receiver) = ipc::channel().unwrap();
         let listener = box NetworkListener {
             context: context,
-            script_chan: script_chan.clone(),
+            script_chan: script_chan.unwrap_or_else(|| self.chan.clone()),
         };
         ROUTER.add_route(action_receiver.to_opaque(), box move |message| {
             listener.notify(message.to().unwrap());
@@ -1959,10 +2024,16 @@ impl ScriptTask {
             preserved_headers: load_data.headers,
             data: load_data.data,
             cors: None,
-            pipeline_id: Some(id),
+            pipeline_id: Some(incomplete.pipeline_id.clone()),
         }, LoadConsumer::Listener(response_target), None)).unwrap();
 
         self.incomplete_loads.borrow_mut().push(incomplete);
+
+        if let Some(script_port) = script_port {
+            while let Ok(event) = script_port.recv() {
+                self.handle_msg_from_script(MainThreadScriptMsg::Common(event));
+            }
+        }
     }
 
     fn handle_parsing_complete(&self, id: PipelineId) {

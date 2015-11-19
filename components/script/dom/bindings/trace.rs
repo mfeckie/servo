@@ -76,6 +76,7 @@ use std::ffi::CString;
 use std::hash::{Hash, Hasher};
 use std::intrinsics::return_address;
 use std::iter::{FromIterator, IntoIterator};
+use std::marker::PhantomData;
 use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
@@ -275,7 +276,6 @@ no_jsmanaged_fields!(WorkerId);
 no_jsmanaged_fields!(QuirksMode);
 no_jsmanaged_fields!(Runtime);
 no_jsmanaged_fields!(Headers, Method);
-no_jsmanaged_fields!(ConstellationChan<ConstellationMsg>);
 no_jsmanaged_fields!(LayoutChan);
 no_jsmanaged_fields!(WindowProxyHandler);
 no_jsmanaged_fields!(UntrustedNodeAddress);
@@ -283,6 +283,7 @@ no_jsmanaged_fields!(LengthOrPercentageOrAuto);
 no_jsmanaged_fields!(RGBA);
 no_jsmanaged_fields!(EuclidLength<Unit, T>);
 no_jsmanaged_fields!(Matrix2D<T>);
+no_jsmanaged_fields!(PhantomData<T>);
 no_jsmanaged_fields!(StorageType);
 no_jsmanaged_fields!(CanvasGradientStop, LinearGradientStyle, RadialGradientStyle);
 no_jsmanaged_fields!(LineCapStyle, LineJoinStyle, CompositionOrBlending);
@@ -298,6 +299,13 @@ no_jsmanaged_fields!(Mime);
 no_jsmanaged_fields!(AttrIdentifier);
 no_jsmanaged_fields!(AttrValue);
 no_jsmanaged_fields!(ElementSnapshot);
+
+impl JSTraceable for ConstellationChan<ConstellationMsg> {
+    #[inline]
+    fn trace(&self, _trc: *mut JSTracer) {
+        // Do nothing
+    }
+}
 
 impl JSTraceable for Box<ScriptChan + Send> {
     #[inline]

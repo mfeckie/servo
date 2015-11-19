@@ -18,8 +18,11 @@ use compositor_task::Msg as ToCompositorMsg;
 use devtools_traits::{ChromeToDevtoolsControlMsg, DevtoolsControlMsg};
 use euclid::scale_factor::ScaleFactor;
 use euclid::size::{Size2D, TypedSize2D};
+use gaol;
+use gaol::sandbox::{self, Sandbox, SandboxMethods};
 use gfx::font_cache_task::FontCacheTask;
-use ipc_channel::ipc::{self, IpcSender};
+use ipc_channel::ipc::{self, IpcOneShotServer, IpcSender};
+use ipc_channel::router::ROUTER;
 use layout_traits::{LayoutControlChan, LayoutTaskFactory};
 use msg::compositor_msg::Epoch;
 use msg::constellation_msg::AnimationState;
@@ -27,6 +30,7 @@ use msg::constellation_msg::CompositorMsg as FromCompositorMsg;
 use msg::constellation_msg::ScriptMsg as FromScriptMsg;
 use msg::constellation_msg::WebDriverCommandMsg;
 use msg::constellation_msg::{FrameId, PipelineId};
+use msg::constellation_msg::{IFrameLoadType};
 use msg::constellation_msg::{IframeLoadInfo, IFrameSandboxState, MozBrowserEvent, NavigationDirection};
 use msg::constellation_msg::{Key, KeyModifiers, KeyState, LoadData};
 use msg::constellation_msg::{PipelineNamespace, PipelineNamespaceId};
@@ -37,19 +41,21 @@ use net_traits::image_cache_task::ImageCacheTask;
 use net_traits::storage_task::{StorageTask, StorageTaskMsg};
 use net_traits::{self, ResourceTask};
 use offscreen_gl_context::GLContextAttributes;
-use pipeline::{CompositionPipeline, InitialPipelineState, Pipeline};
+use pipeline::{CompositionPipeline, InitialPipelineState, Pipeline, UnprivilegedPipelineContent};
 use profile_traits::mem;
 use profile_traits::time;
+use sandboxing;
 use script_traits::{CompositorEvent, ConstellationControlMsg, LayoutControlMsg};
 use script_traits::{ScriptState, ScriptTaskFactory};
 use script_traits::{TimerEventRequest};
 use std::borrow::ToOwned;
 use std::collections::HashMap;
+use std::env;
 use std::io::{self, Write};
 use std::marker::PhantomData;
 use std::mem::replace;
 use std::process;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Sender, channel, Receiver};
 use style_traits::viewport::ViewportConstraints;
 use timer_scheduler::TimerScheduler;
 use url::Url;
@@ -79,7 +85,7 @@ pub struct Constellation<LTF, STF> {
     pub script_sender: ConstellationChan<FromScriptMsg>,
 
     /// A channel through which compositor messages can be sent to this object.
-    pub compositor_sender: ConstellationChan<FromCompositorMsg>,
+    pub compositor_sender: Sender<FromCompositorMsg>,
 
     /// Receives messages from scripts.
     pub script_receiver: Receiver<FromScriptMsg>,
@@ -156,6 +162,9 @@ pub struct Constellation<LTF, STF> {
     webgl_paint_tasks: Vec<Sender<CanvasMsg>>,
 
     scheduler_chan: IpcSender<TimerEventRequest>,
+
+    /// A list of child content processes.
+    child_processes: Vec<ChildProcess>,
 }
 
 /// State needed to construct a constellation.
@@ -259,14 +268,21 @@ enum ExitPipelineMode {
     Force,
 }
 
+enum ChildProcess {
+    Sandboxed(gaol::platform::process::Process),
+    Unsandboxed(process::Child),
+}
+
 impl<LTF: LayoutTaskFactory, STF: ScriptTaskFactory> Constellation<LTF, STF> {
-    pub fn start(state: InitialConstellationState) -> ConstellationChan<FromCompositorMsg> {
-        let (script_receiver, script_sender) = ConstellationChan::<FromScriptMsg>::new();
-        let (compositor_receiver, compositor_sender) = ConstellationChan::<FromCompositorMsg>::new();
+    pub fn start(state: InitialConstellationState) -> Sender<FromCompositorMsg> {
+        let (ipc_script_receiver, ipc_script_sender) = ConstellationChan::<FromScriptMsg>::new();
+        //let (script_receiver, script_sender) = channel();
+        let script_receiver = ROUTER.route_ipc_receiver_to_new_mpsc_receiver(ipc_script_receiver);
+        let (compositor_sender, compositor_receiver) = channel();
         let compositor_sender_clone = compositor_sender.clone();
         spawn_named("Constellation".to_owned(), move || {
             let mut constellation: Constellation<LTF, STF> = Constellation {
-                script_sender: script_sender,
+                script_sender: ipc_script_sender,
                 compositor_sender: compositor_sender_clone,
                 script_receiver: script_receiver,
                 compositor_receiver: compositor_receiver,
@@ -305,6 +321,7 @@ impl<LTF: LayoutTaskFactory, STF: ScriptTaskFactory> Constellation<LTF, STF> {
                 canvas_paint_tasks: Vec::new(),
                 webgl_paint_tasks: Vec::new(),
                 scheduler_chan: TimerScheduler::start(),
+                child_processes: Vec::new(),
             };
             let namespace_id = constellation.next_pipeline_namespace_id();
             PipelineNamespace::install(namespace_id);
@@ -333,10 +350,11 @@ impl<LTF: LayoutTaskFactory, STF: ScriptTaskFactory> Constellation<LTF, STF> {
                     pipeline_id: PipelineId,
                     parent_info: Option<(PipelineId, SubpageId)>,
                     initial_window_size: Option<TypedSize2D<PagePx, f32>>,
-                    script_channel: Option<Sender<ConstellationControlMsg>>,
+                    script_channel: Option<IpcSender<ConstellationControlMsg>>,
+                    replacement_script_channel: Option<IpcSender<ConstellationControlMsg>>,
                     load_data: LoadData) {
         let spawning_paint_only = script_channel.is_some();
-        let (pipeline, mut pipeline_content) =
+        let (pipeline, unprivileged_pipeline_content, mut privileged_pipeline_content) =
             Pipeline::create::<LTF, STF>(InitialPipelineState {
                 id: pipeline_id,
                 parent_info: parent_info,
@@ -352,17 +370,45 @@ impl<LTF: LayoutTaskFactory, STF: ScriptTaskFactory> Constellation<LTF, STF> {
                 mem_profiler_chan: self.mem_profiler_chan.clone(),
                 window_size: initial_window_size,
                 script_chan: script_channel,
+                replacement_script_chan: replacement_script_channel,
                 load_data: load_data,
                 device_pixel_ratio: self.window_size.device_pixel_ratio,
                 pipeline_namespace_id: self.next_pipeline_namespace_id(),
             });
 
-        // TODO(pcwalton): In multiprocess mode, send that `PipelineContent` instance over to
-        // the content process and call this over there.
         if spawning_paint_only {
-            pipeline_content.start_paint_task();
+            privileged_pipeline_content.start_paint_task();
         } else {
-            pipeline_content.start_all::<LTF, STF>();
+            privileged_pipeline_content.start_all();
+
+            // Spawn the child process.
+            //
+            // Yes, that's all there is to it!
+            if opts::multiprocess() {
+                let (server, token) =
+                    IpcOneShotServer::<IpcSender<UnprivilegedPipelineContent>>::new().unwrap();
+
+                // If there is a sandbox, use the `gaol` API to create the child process.
+                let child_process = if opts::get().sandbox {
+                    let mut command = sandbox::Command::me().unwrap();
+                    command.arg("--content-process").arg(token);
+                    let profile = sandboxing::content_process_sandbox_profile();
+                    ChildProcess::Sandboxed(Sandbox::new(profile).start(&mut command).expect(
+                        "Failed to start sandboxed child process!"))
+                } else {
+                    let path_to_self = env::current_exe().unwrap();
+                    let mut child_process = process::Command::new(path_to_self);
+                    child_process.arg("--content-process");
+                    child_process.arg(token);
+                    ChildProcess::Unsandboxed(child_process.spawn().unwrap())
+                };
+                self.child_processes.push(child_process);
+
+                let (_receiver, sender) = server.accept().unwrap();
+                sender.send(unprivileged_pipeline_content).unwrap();
+            } else {
+                unprivileged_pipeline_content.start_all::<LTF, STF>(false);
+            }
         }
 
         assert!(!self.pipelines.contains_key(&pipeline_id));
@@ -508,9 +554,8 @@ impl<LTF: LayoutTaskFactory, STF: ScriptTaskFactory> Constellation<LTF, STF> {
                 self.handle_failure_msg(pipeline_id, parent_info);
             }
             Request::Script(FromScriptMsg::ScriptLoadedURLInIFrame(load_info)) => {
-                debug!("constellation got iframe URL load message {:?} {:?} {:?}",
+                debug!("constellation got iframe URL load message {:?} {:?}",
                        load_info.containing_pipeline_id,
-                       load_info.old_subpage_id,
                        load_info.new_subpage_id);
                 self.handle_script_loaded_url_in_iframe_msg(load_info);
             }
@@ -658,6 +703,7 @@ impl<LTF: LayoutTaskFactory, STF: ScriptTaskFactory> Constellation<LTF, STF> {
                           parent_info,
                           window_size,
                           None,
+                          None,
                           LoadData::new(Url::parse("about:failure").unwrap()));
 
         self.push_pending_frame(new_pipeline_id, Some(pipeline_id));
@@ -667,7 +713,7 @@ impl<LTF: LayoutTaskFactory, STF: ScriptTaskFactory> Constellation<LTF, STF> {
         let window_size = self.window_size.visible_viewport;
         let root_pipeline_id = PipelineId::new();
         debug_assert!(PipelineId::fake_root_pipeline_id() == root_pipeline_id);
-        self.new_pipeline(root_pipeline_id, None, Some(window_size), None, LoadData::new(url.clone()));
+        self.new_pipeline(root_pipeline_id, None, Some(window_size), None, None, LoadData::new(url.clone()));
         self.handle_load_start_msg(&root_pipeline_id);
         self.push_pending_frame(root_pipeline_id, None);
         self.compositor_proxy.send(ToCompositorMsg::ChangePageUrl(root_pipeline_id, url));
@@ -702,33 +748,54 @@ impl<LTF: LayoutTaskFactory, STF: ScriptTaskFactory> Constellation<LTF, STF> {
     // containing_page_pipeline_id's frame tree's children. This message is never the result of a
     // page navigation.
     fn handle_script_loaded_url_in_iframe_msg(&mut self, load_info: IframeLoadInfo) {
+        let containing_pipeline_id = load_info.containing_pipeline_id;
+        let (old_subpage_id, sandbox, url, source_script_chan, replacement_script_chan) =
+            match load_info.load_type {
+                IFrameLoadType::Async(async_load) => (async_load.old_subpage_id,
+                                                      async_load.sandbox,
+                                                      async_load.url,
+                                                      None,
+                                                      None),
+                IFrameLoadType::Sync((sync_script_chan, script_chan)) => {
+                    (None,
+                     IFrameSandboxState::IFrameUnsandboxed,
+                     Url::parse("about:blank").unwrap(),
+                     Some(sync_script_chan.to::<ConstellationControlMsg>()),
+                     Some(script_chan.to::<ConstellationControlMsg>()))
+                }
+        };
+
         // Compare the pipeline's url to the new url. If the origin is the same,
         // then reuse the script task in creating the new pipeline
-        let script_chan = {
+        let (script_chan, replacement_script_chan) = {
             let source_pipeline = self.pipeline(load_info.containing_pipeline_id);
 
             let source_url = source_pipeline.url.clone();
 
-            let same_script = (source_url.host() == load_info.url.host() &&
-                               source_url.port() == load_info.url.port()) &&
-                               load_info.sandbox == IFrameSandboxState::IFrameUnsandboxed;
-
             // FIXME(tkuehn): Need to follow the standardized spec for checking same-origin
-            // Reuse the script task if the URL is same-origin
+            // TODO: use proper origin aliasing to decide about:blank case
+            let same_script =
+                (source_url.host() == url.host() &&
+                 source_url.port() == url.port() &&
+                 sandbox == IFrameSandboxState::IFrameUnsandboxed) ||
+                url.serialize() == "about:blank";
+
+            // Reuse the script task if the URL is considered same-origin
             if same_script {
                 debug!("Constellation: loading same-origin iframe, \
-                        parent url {:?}, iframe url {:?}", source_url, load_info.url);
-                Some(source_pipeline.script_chan.clone())
+                        parent url {:?}, iframe url {:?}", source_url, url);
+                (source_script_chan.or_else(|| Some(source_pipeline.script_chan.clone())),
+                 replacement_script_chan)
             } else {
                 debug!("Constellation: loading cross-origin iframe, \
-                        parent url {:?}, iframe url {:?}", source_url, load_info.url);
-                None
+                        parent url {:?}, iframe url {:?}", source_url, url);
+                (None, None)
             }
         };
 
         // Create the new pipeline, attached to the parent and push to pending frames
-        let old_pipeline_id = load_info.old_subpage_id.map(|old_subpage_id| {
-            self.find_subpage(load_info.containing_pipeline_id, old_subpage_id).id
+        let old_pipeline_id = old_subpage_id.map(|old_subpage_id| {
+            self.find_subpage(containing_pipeline_id, old_subpage_id).id
         });
         let window_size = old_pipeline_id.and_then(|old_pipeline_id| {
             self.pipeline(old_pipeline_id).size
@@ -737,7 +804,8 @@ impl<LTF: LayoutTaskFactory, STF: ScriptTaskFactory> Constellation<LTF, STF> {
                           Some((load_info.containing_pipeline_id, load_info.new_subpage_id)),
                           window_size,
                           script_chan,
-                          LoadData::new(load_info.url));
+                          replacement_script_chan,
+                          LoadData::new(url));
 
         self.subpage_map.insert((load_info.containing_pipeline_id, load_info.new_subpage_id),
                                 load_info.new_pipeline_id);
@@ -801,7 +869,7 @@ impl<LTF: LayoutTaskFactory, STF: ScriptTaskFactory> Constellation<LTF, STF> {
                 // Create the new pipeline
                 let window_size = self.pipeline(source_id).size;
                 let new_pipeline_id = PipelineId::new();
-                self.new_pipeline(new_pipeline_id, None, window_size, None, load_data);
+                self.new_pipeline(new_pipeline_id, None, window_size, None, None, load_data);
                 self.push_pending_frame(new_pipeline_id, Some(source_id));
 
                 // Send message to ScriptTask that will suspend all timers
@@ -1290,7 +1358,7 @@ impl<LTF: LayoutTaskFactory, STF: ScriptTaskFactory> Constellation<LTF, STF> {
 
             // Synchronously query the script task for this pipeline
             // to see if it is idle.
-            let (sender, receiver) = channel();
+            let (sender, receiver) = ipc::channel().unwrap();
             let msg = ConstellationControlMsg::GetCurrentState(sender, frame.current);
             pipeline.script_chan.send(msg).unwrap();
             let result = receiver.recv().unwrap();
@@ -1445,7 +1513,7 @@ impl<LTF: LayoutTaskFactory, STF: ScriptTaskFactory> Constellation<LTF, STF> {
         if let Some(root_frame_id) = self.root_frame_id {
             let frame_tree = self.frame_to_sendable(root_frame_id);
 
-            let (chan, port) = channel();
+            let (chan, port) = ipc::channel().unwrap();
             self.compositor_proxy.send(ToCompositorMsg::SetFrameTree(frame_tree,
                                                                    chan,
                                                                    self.compositor_sender.clone()));
